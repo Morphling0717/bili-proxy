@@ -1,4 +1,3 @@
-// 文件名：api/index.mjs
 export default async function handler(req, res) {
   // 1. 设置跨域头
   res.setHeader('Access-Control-Allow-Credentials', true);
@@ -9,8 +8,7 @@ export default async function handler(req, res) {
     'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
   );
 
-  // 重要：设置 Vercel 缓存策略 (CDN 缓存 60秒，过期后继续服务旧数据 60秒并后台刷新)
-  // 这意味着 1 分钟内无论多少人访问你的接口，Vercel 只会向 B 站发起 1 次请求！
+  // Vercel 缓存策略
   res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=60');
 
   if (req.method === 'OPTIONS') {
@@ -30,8 +28,12 @@ export default async function handler(req, res) {
     // 接口 A: 动态历史
     const dynamicUrl = `https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history?host_uid=${TARGET_UID}&offset_dynamic_id=0&need_top=1&platform=web`;
     
-    // 接口 B: 用户名片 (包含粉丝数、关注数、直播状态) - 这是一个聚合接口，性价比极高
+    // 接口 B: 用户名片 (用于获取头像、粉丝数、关注数)
     const cardUrl = `https://api.bilibili.com/x/web-interface/card?mid=${TARGET_UID}&photo=true`;
+
+    // 接口 C: 直播状态专用接口 (新增！这个接口查直播状态最准)
+    // 注意：这个接口返回的是一个对象，key 是 uid
+    const liveStatusUrl = `https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids?uids[]=${TARGET_UID}`;
 
     // 公用 Headers
     const commonHeaders = {
@@ -40,25 +42,28 @@ export default async function handler(req, res) {
       "Cookie": fullCookie
     };
 
-    // 3. 并发发起请求 (Promise.all 节省时间)
-    const [dynamicRes, cardRes] = await Promise.all([
+    // 3. 并发发起请求 (Promise.all 加入 liveStatusUrl)
+    const [dynamicRes, cardRes, liveRes] = await Promise.all([
       fetch(dynamicUrl, { headers: commonHeaders }),
-      fetch(cardUrl, { headers: commonHeaders })
+      fetch(cardUrl, { headers: commonHeaders }),
+      fetch(liveStatusUrl, { headers: commonHeaders })
     ]);
 
     // 4. 处理响应
-    if (!dynamicRes.ok || !cardRes.ok) {
-      throw new Error(`B站服务器连接失败: 动态(${dynamicRes.status}) / 用户卡片(${cardRes.status})`);
+    if (!dynamicRes.ok || !cardRes.ok || !liveRes.ok) {
+      throw new Error(`B站服务器连接失败`);
     }
 
     const dynamicData = await dynamicRes.json();
     const cardData = await cardRes.json();
+    const liveDataRaw = await liveRes.json();
 
     // 检查业务错误码
     if (dynamicData.code !== 0) throw new Error(`动态API错误: ${dynamicData.message}`);
     if (cardData.code !== 0) throw new Error(`用户卡片API错误: ${cardData.message}`);
+    // 直播接口很少报错，即使没开播 code 也是 0
 
-    // 5. 解析动态数据 (保持你原有的逻辑)
+    // 5. 解析动态数据
     const cards = dynamicData.data?.cards || [];
     const videos = [];
 
@@ -84,20 +89,24 @@ export default async function handler(req, res) {
       }
     }
 
-    // 6. 解析用户信息 (直播 + 粉丝)
+    // 6. 解析用户信息
     const cardInfo = cardData.data?.card || {};
-    const liveInfo = dynamicData.data?.card?.live_room || cardData.data?.card?.live_room; 
-    // 注意：card接口里的 live_room 有时比 dynamic 里的准，优先用 card 里的
+    
+    // 解析直播数据 (从专用接口获取)
+    // 结构是: data: { "uid": { ...info } }
+    const targetLiveInfo = liveDataRaw.data?.[TARGET_UID] || {};
 
     const userInfo = {
       name: cardInfo.name,
       face: cardInfo.face,
-      fans: cardInfo.fans, // 粉丝数
-      attention: cardInfo.attention, // 关注数
-      is_live: Boolean(cardData.data?.live_room?.liveStatus === 1), // 1 为正在直播
-      live_title: cardData.data?.live_room?.title || "",
-      live_url: cardData.data?.live_room?.url ? `https://live.bilibili.com/${cardData.data.live_room.roomid}` : "",
-      live_cover: cardData.data?.live_room?.cover || ""
+      fans: cardInfo.fans,
+      attention: cardInfo.attention,
+      // 核心修改：使用专用接口数据，且字段名为 snake_case (live_status)
+      is_live: targetLiveInfo.live_status === 1, 
+      live_title: targetLiveInfo.title || "",
+      live_url: targetLiveInfo.room_id ? `https://live.bilibili.com/${targetLiveInfo.room_id}` : "",
+      // cover_from_user 通常是用户上传的封面
+      live_cover: targetLiveInfo.cover_from_user || targetLiveInfo.keyframe || ""
     };
 
     // 7. 返回合并后的数据
