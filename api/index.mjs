@@ -24,14 +24,14 @@ export default async function handler(req, res) {
       throw new Error("环境变量 BI_COOKIE 未配置");
     }
 
-    // 2. 准备 API URL
+    // 2. 准备 API URL（注意：这里把 TARGET_UID 真正拼进去了）
     // 接口 A: 动态历史
     const dynamicUrl = `https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history?host_uid=${TARGET_UID}&offset_dynamic_id=0&need_top=1&platform=web`;
-    
+
     // 接口 B: 用户名片 (用于获取头像、粉丝数、关注数)
     const cardUrl = `https://api.bilibili.com/x/web-interface/card?mid=${TARGET_UID}&photo=true`;
 
-    // 接口 C: 直播状态专用接口 (新增！这个接口查直播状态最准)
+    // 接口 C: 直播状态专用接口
     // 注意：这个接口返回的是一个对象，key 是 uid
     const liveStatusUrl = `https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids?uids[]=${TARGET_UID}`;
 
@@ -42,25 +42,25 @@ export default async function handler(req, res) {
       "Cookie": fullCookie
     };
 
-    // 3. 并发发起请求 (Promise.all 加入 liveStatusUrl)
+    // 3. 并发发起请求
     const [dynamicRes, cardRes, liveRes] = await Promise.all([
       fetch(dynamicUrl, { headers: commonHeaders }),
       fetch(cardUrl, { headers: commonHeaders }),
       fetch(liveStatusUrl, { headers: commonHeaders })
     ]);
 
-    // 4. 处理响应
-    if (!dynamicRes.ok || !cardRes.ok || !liveRes.ok) {
-      throw new Error(`B站服务器连接失败`);
-    }
+    // 4. 处理响应（拆细，方便定位是哪个接口、哪个状态码出问题）
+    if (!dynamicRes.ok) throw new Error(`动态接口 HTTP ${dynamicRes.status}`);
+    if (!cardRes.ok) throw new Error(`卡片接口 HTTP ${cardRes.status}`);
+    if (!liveRes.ok) throw new Error(`直播接口 HTTP ${liveRes.status}`);
 
     const dynamicData = await dynamicRes.json();
     const cardData = await cardRes.json();
     const liveDataRaw = await liveRes.json();
 
     // 检查业务错误码
-    if (dynamicData.code !== 0) throw new Error(`动态API错误: ${dynamicData.message}`);
-    if (cardData.code !== 0) throw new Error(`用户卡片API错误: ${cardData.message}`);
+    if (dynamicData.code !== 0) throw new Error(`动态API错误: ${dynamicData.code} ${dynamicData.message || ""}`);
+    if (cardData.code !== 0) throw new Error(`用户卡片API错误: ${cardData.code} ${cardData.message || ""}`);
     // 直播接口很少报错，即使没开播 code 也是 0
 
     // 5. 解析动态数据
@@ -71,12 +71,13 @@ export default async function handler(req, res) {
       if (item.desc?.type === 8) { // 8 = 投稿视频
         try {
           const cardDetail = JSON.parse(item.card);
+          const bvid = item.desc.bvid || cardDetail.bvid;
           videos.push({
             title: cardDetail.title,
             desc: cardDetail.desc,
             pic: cardDetail.pic,
-            bvid: item.desc.bvid || cardDetail.bvid,
-            url: `https://www.bilibili.com/video/${item.desc.bvid || cardDetail.bvid}`,
+            bvid: bvid,
+            url: `https://www.bilibili.com/video/${bvid}`,
             created: item.desc.timestamp,
             length: cardDetail.duration,
             play: cardDetail.stat?.view,
@@ -91,7 +92,7 @@ export default async function handler(req, res) {
 
     // 6. 解析用户信息
     const cardInfo = cardData.data?.card || {};
-    
+
     // 解析直播数据 (从专用接口获取)
     // 结构是: data: { "uid": { ...info } }
     const targetLiveInfo = liveDataRaw.data?.[TARGET_UID] || {};
@@ -101,8 +102,8 @@ export default async function handler(req, res) {
       face: cardInfo.face,
       fans: cardInfo.fans,
       attention: cardInfo.attention,
-      // 核心修改：使用专用接口数据，且字段名为 snake_case (live_status)
-      is_live: targetLiveInfo.live_status === 1, 
+      // 使用专用接口数据，字段名为 snake_case (live_status)
+      is_live: targetLiveInfo.live_status === 1,
       live_title: targetLiveInfo.title || "",
       live_url: targetLiveInfo.room_id ? `https://live.bilibili.com/${targetLiveInfo.room_id}` : "",
       // cover_from_user 通常是用户上传的封面
