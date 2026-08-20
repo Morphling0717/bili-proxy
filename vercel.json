@@ -3,7 +3,9 @@
   "fluid": true,
   "functions": {
     "api/index.mjs": {
-      "maxDuration": 60
+      "maxDuration": 120,
+      "memory": 2048,
+      "includeFiles": "node_modules/@sparticuz/chromium/bin/**"
     }
   }
 }

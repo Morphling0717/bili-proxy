@@ -1,8 +1,15 @@
 {
   "name": "bili-proxy",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "engines": { "node": "20.x" },
-  "scripts": { "check": "node --check api/index.mjs" }
+  "scripts": {
+    "check": "node --check api/index.mjs && node --check lib/core.mjs && node --check lib/browser-videos.mjs",
+    "test": "node --test test/browser-videos.test.mjs"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "143.0.4",
+    "puppeteer-core": "24.34.0"
+  }
 }

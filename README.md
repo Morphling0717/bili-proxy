@@ -1,8 +1,8 @@
-# bili-proxy 2.0
+# bili-proxy 2.1
 
 一个部署在 Vercel Functions 上的 Bilibili **公开用户资料与公开内容聚合 API**。
 
-这个版本保留旧接口的 `user`、`video_count`、`videos` 字段，因此原来的前端可以继续使用；同时把单一 UID、单一动态接口重构成通用的分区式采集服务。
+这个版本保留旧接口的 `user`、`video_count`、`videos` 字段，因此原来的前端可以继续使用；同时把单一 UID、单一动态接口重构成通用的分区式采集服务。投稿接口遇到 Bilibili `-352` / HTTP 412 风控时，会自动启动真实 Chromium 页面会话作为兜底。
 
 ## 能获取什么
 
@@ -69,6 +69,13 @@ GET /api?help=1
 GET /api?mid=<UID>&section=videos&debug=1
 ```
 
+强制测试浏览器兜底或临时关闭：
+
+```text
+GET /api?mid=<UID>&section=videos&browser_force=1
+GET /api?mid=<UID>&section=videos&browser=0
+```
+
 ## 全量抓取的设计
 
 Vercel Function 不适合在一次请求里无限翻页。`complete=1` 支持每个 section 最多连续 10 页，并设置总上游请求预算。响应中的：
@@ -100,7 +107,7 @@ Vercel Function 不适合在一次请求里无限翻页。`complete=1` 支持每
 }
 ```
 
-只有全部请求都失败时才返回 HTTP `502`。
+投稿的普通 HTTP 请求若被风控拦截，服务会先启动浏览器兜底；浏览器也失败时才保留该 section 的错误。只有全部请求都失败时才返回 HTTP `502`。
 
 ## 环境变量
 
@@ -112,7 +119,10 @@ Vercel Function 不适合在一次请求里无限翻页。`complete=1` 支持每
 | `TARGET_UID` | 否 | 省略 `mid` 时使用的默认 UID。 |
 | `CORS_ORIGIN` | 否 | 限制允许访问 API 的前端来源，默认 `*`。 |
 | `BILI_TIMEOUT_MS` | 否 | 上游请求超时，默认 7000ms。 |
-| `BILI_USER_AGENT` | 否 | 覆盖默认浏览器 User-Agent。 |
+| `BILI_USER_AGENT` | 否 | 覆盖普通 HTTP 请求的 User-Agent。 |
+| `BROWSER_FALLBACK` | 否 | 设为 `0` 可关闭投稿浏览器兜底，默认开启。 |
+| `BILI_BROWSER_USER_AGENT` | 否 | 覆盖 Chromium 页面会话的 User-Agent。 |
+| `CHROME_EXECUTABLE_PATH` | 否 | 本地调试时指定 Chrome 路径；Vercel 上无需设置。 |
 
 ## 稳定性处理
 
@@ -120,6 +130,8 @@ Vercel Function 不适合在一次请求里无限翻页。`complete=1` 支持每
 - 从用户空间 HTML 获取该 UID 对应的 `access_id` / `w_webid`
 - 每次启动获取最新 WBI key 并签名
 - 补齐网页端要求的动态验证参数
+- 投稿接口被 `-352` / 412 拦截时，自动运行 Chromium 并监听用户空间页面自己发出的公开接口请求
+- 连续翻页复用同一个浏览器会话，不为每一页重复冷启动
 - CDN 缓存 5 分钟，并允许 1 小时 stale-while-revalidate
 - 每个 section 局部失败，不让一个失效接口拖垮整份响应
 - 输入上限、请求超时、连续翻页上限与总请求预算
