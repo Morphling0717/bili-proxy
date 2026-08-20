@@ -1,21 +1,21 @@
-# bili-proxy 3.0
+# bili-proxy 3.1
 
-部署在 Vercel Functions 上的 Bilibili **公开用户资料与公开内容聚合 API**。它不再依赖一个容易被 `412/-352` 风控拦截的网页投稿接口，而是按内容类型采用多级公开接口、分页游标和局部失败策略。
+部署在 Vercel Functions 上的 Bilibili **公开用户资料与公开内容聚合 API**。服务按内容类型使用多级公开接口、签名 APP 投稿游标、分页和局部失败策略，不再把成败押在一个容易触发 `412/-352` 风控的网页接口上。
 
-旧版的根级 `user`、`video_count`、`videos` 字段仍保留；新项目应优先读取 `sections`。
+旧版根级 `user`、`video_count`、`videos` 字段仍保留；新项目应优先读取 `sections`。
 
 ## 已覆盖的公开内容
 
 `section=everything` 会尽可能抓取一个用户空间中访客可见的内容：
 
 - `profile`：头像、昵称、签名、认证、等级、公开统计、置顶稿件、直播状态
-- `videos`：全部公开视频投稿；网页接口被风控时自动切到签名 APP 投稿接口
+- `videos`：全部公开视频投稿；网页接口被风控时自动切到签名 APP 投稿游标
 - `dynamics`：旧动态流与新版 Opus 图文流合并、去重
 - `articles`：公开专栏
 - `audio`：公开音频投稿
 - `collections`：合集与系列，多接口回退
 - `favorites`：创建与收藏的公开收藏夹；可继续展开收藏夹内容
-- `following` / `followers`：平台允许匿名访问时返回公开关注与粉丝列表
+- `following` / `followers`：网页关系接口失败时，自动切换到匿名游戏端公开列表
 - `public_extras`：代表作、标签、公告、近期点赞、近期投币、近期游戏、追番、追剧
 
 按 ID 获取内容：
@@ -24,7 +24,7 @@
 - `season_items`：合集内稿件，需要 `season_id`
 - `favorite_items`：公开收藏夹内容，需要 `media_id`
 
-只采集公开接口能够返回的数据。空间主人隐藏的分区会标为 `empty_or_not_public` 或保留上游错误，不会尝试绕过登录、验证码、隐私设置或访问控制。
+只采集公开接口能够返回的数据。空间主人隐藏的分区会标为 `privacy_restricted`、`empty_or_private` 或保留上游错误，不会尝试绕过登录、验证码、隐私设置或访问控制。
 
 ## 常用请求
 
@@ -52,16 +52,17 @@ GET /api?mid=3546779356235807&section=videos&complete=1&max_pages=10&page_size=3
 GET /api?mid=3546779356235807&section=dynamics&public_force=1&complete=1&max_pages=5
 ```
 
-单独获取扩展资料：
+单独获取公开关注或粉丝列表：
 
 ```text
-GET /api?mid=3546779356235807&section=public_extras
+GET /api?mid=<UID>&section=following&complete=1&max_pages=10
+GET /api?mid=<UID>&section=followers&complete=1&max_pages=10
 ```
 
 公开收藏夹目录及内容：
 
 ```text
-GET /api?mid=3546779356235807&section=favorites&public_force=1&expand_favorites=1
+GET /api?mid=<UID>&section=favorites&public_force=1&expand_favorites=1
 ```
 
 合集、系列或收藏夹内内容：
@@ -101,6 +102,25 @@ Vercel Function 不适合无限循环。用户内容超过单次上限时，调�
 
 可以通过 `public_request_budget`、`favorite_folder_limit` 等参数收紧，但不会超过服务端硬上限。
 
+## 关注与粉丝列表语义
+
+关系分区采用三层证据链：
+
+1. 先请求常规网页关系接口。
+2. 登录态失效或网页接口被风控时，切换到匿名游戏端公开列表。
+3. 若匿名列表为空且响应没有总数，再查询公开关系统计，区分“确实为 0”和“名单被隐藏”。
+
+关键返回字段：
+
+- `total`：公开统计中的真实总数；无法确认时为 `null`
+- `accessible_total`：当前公开接口实际允许取得的数量
+- `privacy_restricted=true`：总数大于 0，但公开名单为空，说明目标关闭了名单展示
+- `privacy_restricted=null`：名单为空且统计接口也不可用，无法判断是空还是隐藏
+- `completeness=empty_or_private`：证据不足，不会把未知情况伪报成 0
+- `public_cap=100`：粉丝匿名公开窗口最多前 100 人
+
+这些限制来自上游公开接口，不代表目标账号只有这么多人。
+
 ## 投稿抓取策略
 
 1. 先尝试网页 WBI 投稿接口。
@@ -124,8 +144,8 @@ GET /api?mid=<UID>&section=videos&browser_force=1
 ```json
 {
   "success": true,
-  "partial": true,
-  "version": "3.0.0",
+  "partial": false,
+  "version": "3.1.0",
   "uid": "3546779356235807",
   "sections": {
     "profile": { "ok": true, "data": {} },
@@ -139,8 +159,16 @@ GET /api?mid=<UID>&section=videos&browser_force=1
       }
     },
     "followers": {
-      "ok": false,
-      "error": { "type": "upstream", "message": "..." }
+      "ok": true,
+      "source": "biligame_public_relation",
+      "data": {
+        "items": [],
+        "total": 2057,
+        "accessible_total": 0,
+        "public_cap": 100,
+        "privacy_restricted": true,
+        "completeness": "privacy_restricted"
+      }
     }
   }
 }
@@ -158,6 +186,7 @@ GET /api?mid=<UID>&section=videos&browser_force=1
 | `BILI_TIMEOUT_MS` | 否 | 普通上游请求超时。 |
 | `BILI_USER_AGENT` | 否 | 普通公开请求 User-Agent。 |
 | `APP_FALLBACK` | 否 | 设为 `0` 关闭 APP 投稿回退，默认开启。 |
+| `RELATION_FALLBACK` | 否 | 设为 `0` 关闭匿名公开关系回退，默认开启。 |
 | `BROWSER_FALLBACK` | 否 | 设为 `1` 开启 Chromium 最后回退，默认关闭。 |
 | `BILI_BROWSER_USER_AGENT` | 否 | Chromium User-Agent。 |
 | `CHROME_EXECUTABLE_PATH` | 否 | 本地调试 Chrome 路径。 |
@@ -170,6 +199,7 @@ GET /api?mid=<UID>&section=videos&browser_force=1
 - 失效 `SESSDATA/bili_jct` 自动剥离后匿名重试
 - APP `aid` 游标翻页、跨页去重和真实总数校验
 - 动态双流合并、合集三级回退、收藏夹可见性区分
+- 匿名关系回退、公开总数佐证与粉丝前 100 人上限标记
 - 每项请求超时、连续翻页上限、总请求预算
 - CDN 缓存和 `stale-while-revalidate`
 - 错误按分区隔离，诊断信息不泄露凭证
