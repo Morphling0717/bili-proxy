@@ -7,10 +7,14 @@ import {
   BrowserVideoError,
   fetchVideosWithBrowser,
 } from '../lib/browser-videos.mjs';
+import {
+  PublicSectionError,
+  collectPublicSections,
+} from '../lib/public-sections.mjs';
 
 export const config = { maxDuration: 120 };
 
-const VERSION = '2.2.0';
+const VERSION = '3.0.0';
 
 const bool = (value) =>
   ['1', 'true', 'yes', 'on'].includes(
@@ -73,6 +77,16 @@ class CaptureResponse {
   }
 }
 
+function sectionNames(value) {
+  return new Set(
+    text(value, 'all')
+      .toLowerCase()
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean),
+  );
+}
+
 function riskFailure(section) {
   if (!section || section.ok) return false;
   const upstream = section.error?.upstream || {};
@@ -103,21 +117,25 @@ function legacyVideo(item) {
   };
 }
 
-function recomputeStatus(body) {
-  const sections = Object.values(body?.sections || {});
+function recomputeStatus(body, fallbackStatus = 200) {
+  if (!body?.sections || typeof body.sections !== 'object') return fallbackStatus;
+  const sections = Object.values(body.sections);
+  if (sections.length === 0) return fallbackStatus;
   const successful = sections.filter((section) => section?.ok).length;
   body.success = successful > 0;
   body.partial = successful > 0 && successful < sections.length;
   return successful > 0 ? 200 : 502;
 }
 
-function safeVideoFailure(error, type) {
+function safeFallbackFailure(error, type) {
   return {
     type,
     message: error?.message || String(error),
     diagnostics:
-      error instanceof AppVideoError || error instanceof BrowserVideoError
-        ? error.diagnostics || {}
+      error instanceof AppVideoError ||
+      error instanceof BrowserVideoError ||
+      error instanceof PublicSectionError
+        ? error.diagnostics || error.details || {}
         : {},
   };
 }
@@ -139,7 +157,32 @@ function installVideoResult(captured, result, source) {
     ...(captured.body.request || {}),
     video_fallback: source,
   };
-  captured.statusCode = recomputeStatus(captured.body);
+  captured.statusCode = recomputeStatus(captured.body, captured.statusCode);
+}
+
+function mergePublicSection(body, name, incoming) {
+  const previous = body.sections?.[name];
+  if (incoming?.ok) {
+    body.sections[name] = incoming;
+    if (name === 'public_extras') body.extras = incoming.data;
+    return;
+  }
+  if (previous?.ok) {
+    body.sections[name] = {
+      ...previous,
+      public_fallback_error: incoming?.error || null,
+    };
+    return;
+  }
+  body.sections[name] = {
+    ...(previous || {}),
+    ok: false,
+    error: previous?.error || incoming?.error || {
+      type: 'internal',
+      message: `${name} failed`,
+    },
+    public_fallback_error: incoming?.error || null,
+  };
 }
 
 function replay(captured, req, res) {
@@ -165,12 +208,9 @@ function isEverything(query) {
   return ['everything', 'full', 'all_public'].includes(section);
 }
 
-export default async function handler(req, res) {
-  const started = Date.now();
-  const originalQuery = req.query || {};
-  const everything = isEverything(originalQuery);
+function prepareCoreQuery(originalQuery, everything) {
   if (everything) {
-    req.query = {
+    return {
       ...originalQuery,
       section:
         'profile,videos,dynamics,articles,audio,collections,favorites,following,followers',
@@ -180,7 +220,45 @@ export default async function handler(req, res) {
     };
   }
 
+  const raw = text(originalQuery.section || originalQuery.include || 'all');
+  const names = raw
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean);
+  const extrasRequested = names.some((name) => name.toLowerCase() === 'public_extras');
+  if (!extrasRequested) return originalQuery;
+  const coreNames = names.filter((name) => name.toLowerCase() !== 'public_extras');
+  return {
+    ...originalQuery,
+    section: coreNames.length ? coreNames.join(',') : 'profile',
+  };
+}
+
+function wantsPublicExtras(originalQuery, everything) {
+  return (
+    everything ||
+    bool(originalQuery.extras || originalQuery.public_extras) ||
+    sectionNames(originalQuery.section || originalQuery.include).has('public_extras')
+  );
+}
+
+function wantsRequestedSection(originalQuery, coreQuery, everything, name) {
+  if (everything) return true;
+  const original = sectionNames(originalQuery.section || originalQuery.include);
+  if (original.has('all')) {
+    return ['dynamics', 'collections', 'favorites'].includes(name);
+  }
+  const core = sectionNames(coreQuery.section || coreQuery.include);
+  return original.has(name) || core.has(name);
+}
+
+export default async function handler(req, res) {
+  const started = Date.now();
+  const originalQuery = req.query || {};
+  const everything = isEverything(originalQuery);
+  req.query = prepareCoreQuery(originalQuery, everything);
   const query = req.query || {};
+
   const captured = new CaptureResponse();
   await coreHandler(req, captured);
   captured.setHeader('X-Bili-Proxy-Version', VERSION);
@@ -190,12 +268,28 @@ export default async function handler(req, res) {
   }
 
   const body = captured.body;
-  const videoSection = body?.sections?.videos;
-  const mid = String(body?.uid || query.mid || query.uid || '');
+  if (!body?.sections || typeof body.sections !== 'object') {
+    if (body && bool(originalQuery.help)) {
+      body.version = VERSION;
+      body.modes = ['all', 'everything'];
+      body.public_sections = ['public_extras'];
+      body.examples = [
+        ...(Array.isArray(body.examples) ? body.examples : []),
+        '/api?mid=3546779356235807&section=everything',
+        '/api?mid=3546779356235807&section=videos&complete=1&max_pages=10',
+      ];
+    }
+    if (body && typeof body === 'object') body.elapsed_ms = Date.now() - started;
+    return replay(captured, req, res);
+  }
+
+  const videoSection = body.sections.videos;
+  const mid = String(body.uid || query.mid || query.uid || '');
   const page = int(query.page, 1, 1, 10_000);
   const pageSize = int(query.page_size || query.ps, 30, 1, 50);
   const complete = bool(query.complete || query.deep);
   const maxPages = int(query.max_pages, complete ? 5 : 1, 1, 10);
+  const debug = bool(query.debug);
 
   const appEnabled = !['0', 'false', 'off'].includes(
     text(query.app_fallback, process.env.APP_FALLBACK ?? '1').toLowerCase(),
@@ -205,7 +299,6 @@ export default async function handler(req, res) {
 
   if (
     req.method !== 'OPTIONS' &&
-    body &&
     appEnabled &&
     videoSection &&
     (forceApp || !videoSection.ok || riskFailure(videoSection))
@@ -226,11 +319,11 @@ export default async function handler(req, res) {
       body.video_fallback = {
         used: false,
         source: 'app_archive_cursor',
-        error: safeVideoFailure(error, 'app_fallback'),
+        error: safeFallbackFailure(error, 'app_fallback'),
       };
       body.sections.videos.error = {
         ...(body.sections.videos.error || {}),
-        app_fallback: safeVideoFailure(error, 'app_fallback'),
+        app_fallback: safeFallbackFailure(error, 'app_fallback'),
       };
       body.request = {
         ...(body.request || {}),
@@ -243,11 +336,10 @@ export default async function handler(req, res) {
     text(query.browser, process.env.BROWSER_FALLBACK ?? '0').toLowerCase(),
   );
   const forceBrowser = bool(query.browser_force);
-  const currentVideoSection = body?.sections?.videos;
+  const currentVideoSection = body.sections.videos;
 
   if (
     req.method !== 'OPTIONS' &&
-    body &&
     browserEnabled &&
     currentVideoSection &&
     (forceBrowser || (appFailed && riskFailure(currentVideoSection)))
@@ -273,18 +365,88 @@ export default async function handler(req, res) {
     } catch (error) {
       body.browser_fallback = {
         used: false,
-        error: safeVideoFailure(error, 'browser_fallback'),
+        error: safeFallbackFailure(error, 'browser_fallback'),
       };
       body.sections.videos.error = {
         ...(body.sections.videos.error || {}),
-        browser_fallback: safeVideoFailure(error, 'browser_fallback'),
+        browser_fallback: safeFallbackFailure(error, 'browser_fallback'),
       };
     }
   }
 
-  if (body && typeof body === 'object') {
-    captured.statusCode = recomputeStatus(body);
-    body.elapsed_ms = Date.now() - started;
+  const publicForce = bool(query.public_force || query.enhanced);
+  const publicSections = [];
+  for (const name of [
+    'dynamics',
+    'collections',
+    'favorites',
+    'following',
+    'followers',
+  ]) {
+    if (!wantsRequestedSection(originalQuery, query, everything, name)) continue;
+    const current = body.sections[name];
+    const ambiguousFavorite =
+      name === 'favorites' &&
+      current?.ok &&
+      (current.data === null || current.data === undefined || !Array.isArray(current.data?.list));
+    if (
+      everything ||
+      publicForce ||
+      !current?.ok ||
+      riskFailure(current) ||
+      ambiguousFavorite
+    ) {
+      publicSections.push(name);
+    }
   }
+  if (wantsPublicExtras(originalQuery, everything)) publicSections.push('public_extras');
+
+  if (publicSections.length > 0 && req.method !== 'OPTIONS') {
+    try {
+      const publicResult = await collectPublicSections({
+        mid,
+        sections: [...new Set(publicSections)],
+        complete,
+        maxPages,
+        pageSize,
+        dynamicOffset: text(query.offset),
+        opusOffset: text(query.opus_offset),
+        expandFavorites:
+          bool(query.expand_favorites || query.favorite_items) || everything,
+        favoriteFolderLimit: int(
+          query.favorite_folder_limit,
+          everything ? 5 : 10,
+          1,
+          20,
+        ),
+        timeoutMs: int(query.public_timeout_ms, 10_000, 3_000, 30_000),
+        requestBudget: int(
+          query.public_request_budget,
+          everything ? 80 : 40,
+          4,
+          80,
+        ),
+        cookie: process.env.BI_COOKIE || '',
+      });
+      for (const [name, result] of Object.entries(publicResult.sections)) {
+        mergePublicSection(body, name, result);
+      }
+      body.request = {
+        ...(body.request || {}),
+        public_collector: [...new Set(publicSections)],
+      };
+      if (debug) {
+        body.diagnostics = {
+          ...(body.diagnostics || {}),
+          public_collector: publicResult.diagnostics,
+        };
+      }
+    } catch (error) {
+      body.public_collector_error = safeFallbackFailure(error, 'public_collector');
+    }
+  }
+
+  captured.statusCode = recomputeStatus(body, captured.statusCode);
+  body.elapsed_ms = Date.now() - started;
   return replay(captured, req, res);
 }
