@@ -2,9 +2,16 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "fluid": true,
   "regions": ["sin1"],
+  "rewrites": [
+    { "source": "/api", "destination": "/api/v31" }
+  ],
   "functions": {
     "api/index.mjs": {
       "maxDuration": 120,
+      "includeFiles": "node_modules/@sparticuz/chromium/bin/**"
+    },
+    "api/v31.mjs": {
+      "maxDuration": 300,
       "includeFiles": "node_modules/@sparticuz/chromium/bin/**"
     }
   }
