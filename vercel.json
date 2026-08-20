@@ -1,10 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "fluid": true,
+  "regions": ["sin1"],
   "functions": {
     "api/index.mjs": {
       "maxDuration": 120,
-      "memory": 2048,
       "includeFiles": "node_modules/@sparticuz/chromium/bin/**"
     }
   }
