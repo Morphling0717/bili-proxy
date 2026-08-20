@@ -8,13 +8,17 @@ import {
   fetchVideosWithBrowser,
 } from '../lib/browser-videos.mjs';
 import {
+  PublicRelationError,
+  fetchPublicRelations,
+} from '../lib/public-relations.mjs';
+import {
   PublicSectionError,
   collectPublicSections,
 } from '../lib/public-sections.mjs';
 
 export const config = { maxDuration: 120 };
 
-const VERSION = '3.0.0';
+const VERSION = '3.1.0';
 
 const bool = (value) =>
   ['1', 'true', 'yes', 'on'].includes(
@@ -92,10 +96,13 @@ function riskFailure(section) {
   const upstream = section.error?.upstream || {};
   const message = `${section.error?.message || ''} ${upstream.message || ''}`;
   return (
+    upstream.code === -101 ||
     upstream.code === -352 ||
     upstream.code === -412 ||
     [403, 412, 429].includes(upstream.http_status) ||
-    /风控|risk|banned|forbidden|precondition|too many/iu.test(message)
+    /风控|未登录|not logged|risk|banned|forbidden|precondition|too many/iu.test(
+      message,
+    )
   );
 }
 
@@ -140,6 +147,7 @@ function safeFallbackFailure(error, type) {
     diagnostics:
       error instanceof AppVideoError ||
       error instanceof BrowserVideoError ||
+      error instanceof PublicRelationError ||
       error instanceof PublicSectionError
         ? error.diagnostics || error.details || {}
         : {},
@@ -191,6 +199,31 @@ function mergePublicSection(body, name, incoming) {
   };
 }
 
+function installRelationResult(body, name, result) {
+  const previous = body.sections?.[name];
+  body.sections[name] = {
+    ok: true,
+    data: result.data,
+    source: 'biligame_public_relation',
+    ...(previous?.error ? { fallback_from: previous.error } : {}),
+  };
+  body.relation_fallback = {
+    ...(body.relation_fallback || {}),
+    [name]: {
+      used: true,
+      source: 'biligame_public_relation',
+      diagnostics: result.diagnostics,
+    },
+  };
+}
+
+function relationKnownTotal(body, name) {
+  const statistics = body.sections?.profile?.data?.statistics;
+  const candidate =
+    name === 'following' ? statistics?.following : statistics?.followers;
+  return Number.isFinite(Number(candidate)) ? Number(candidate) : null;
+}
+
 function replay(captured, req, res) {
   for (const [name, value] of captured.headers) res.setHeader(name, value);
   const status = captured.statusCode || 200;
@@ -231,9 +264,13 @@ function prepareCoreQuery(originalQuery, everything) {
     .split(',')
     .map((name) => name.trim())
     .filter(Boolean);
-  const extrasRequested = names.some((name) => name.toLowerCase() === 'public_extras');
+  const extrasRequested = names.some(
+    (name) => name.toLowerCase() === 'public_extras',
+  );
   if (!extrasRequested) return originalQuery;
-  const coreNames = names.filter((name) => name.toLowerCase() !== 'public_extras');
+  const coreNames = names.filter(
+    (name) => name.toLowerCase() !== 'public_extras',
+  );
   return {
     ...originalQuery,
     section: coreNames.length ? coreNames.join(',') : 'profile',
@@ -244,7 +281,9 @@ function wantsPublicExtras(originalQuery, everything) {
   return (
     everything ||
     bool(originalQuery.extras || originalQuery.public_extras) ||
-    sectionNames(originalQuery.section || originalQuery.include).has('public_extras')
+    sectionNames(originalQuery.section || originalQuery.include).has(
+      'public_extras',
+    )
   );
 }
 
@@ -398,7 +437,9 @@ export default async function handler(req, res) {
     const ambiguousFavorite =
       name === 'favorites' &&
       current?.ok &&
-      (current.data === null || current.data === undefined || !Array.isArray(current.data?.list));
+      (current.data === null ||
+        current.data === undefined ||
+        !Array.isArray(current.data?.list));
     if (
       everything ||
       publicForce ||
@@ -409,7 +450,9 @@ export default async function handler(req, res) {
       publicSections.push(name);
     }
   }
-  if (wantsPublicExtras(originalQuery, everything)) publicSections.push('public_extras');
+  if (wantsPublicExtras(originalQuery, everything)) {
+    publicSections.push('public_extras');
+  }
 
   if (publicSections.length > 0 && req.method !== 'OPTIONS') {
     try {
@@ -452,7 +495,60 @@ export default async function handler(req, res) {
         };
       }
     } catch (error) {
-      body.public_collector_error = safeFallbackFailure(error, 'public_collector');
+      body.public_collector_error = safeFallbackFailure(
+        error,
+        'public_collector',
+      );
+    }
+  }
+
+  const relationNames = ['following', 'followers'].filter((name) =>
+    wantsRequestedSection(originalQuery, query, everything, name),
+  );
+  const relationDiagnostics = {};
+  for (const name of relationNames) {
+    const current = body.sections[name];
+    if (current?.ok && !publicForce) continue;
+    try {
+      const relationResult = await fetchPublicRelations({
+        mid,
+        kind: name,
+        page,
+        pageSize,
+        complete,
+        maxPages,
+        knownTotal: relationKnownTotal(body, name),
+        timeoutMs: int(query.relation_timeout_ms, 10_000, 3_000, 30_000),
+      });
+      installRelationResult(body, name, relationResult);
+      relationDiagnostics[name] = relationResult.diagnostics;
+    } catch (error) {
+      const fallbackError = safeFallbackFailure(error, 'relation_fallback');
+      body.sections[name] = {
+        ...(current || {}),
+        ok: false,
+        error:
+          current?.error ||
+          fallbackError || {
+            type: 'relation_fallback',
+            message: `${name} failed`,
+          },
+        relation_fallback_error: fallbackError,
+      };
+      relationDiagnostics[name] = fallbackError.diagnostics || {};
+    }
+  }
+
+  if (relationNames.length > 0) {
+    body.request = {
+      ...(body.request || {}),
+      relation_fallback: relationNames,
+    };
+    if (debug) {
+      body.diagnostics = {
+        ...(body.diagnostics || {}),
+        relation_fallback: relationDiagnostics,
+      };
     }
   }
 
