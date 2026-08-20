@@ -18,7 +18,7 @@ import {
 
 export const config = { maxDuration: 120 };
 
-const VERSION = '3.1.0';
+const VERSION = '3.2.0';
 
 const bool = (value) =>
   ['1', 'true', 'yes', 'on'].includes(
@@ -174,28 +174,48 @@ function installVideoResult(captured, result, source) {
   captured.statusCode = recomputeStatus(captured.body, captured.statusCode);
 }
 
+function normalizePublicSection(name, incoming) {
+  if (name !== 'dynamics' || !incoming?.ok || !incoming.data) return incoming;
+  const streams = incoming.data.streams || {};
+  const legacy = streams.legacy_space_history || null;
+  const opus = streams.opus_feed_space || null;
+  return {
+    ...incoming,
+    data: {
+      ...incoming.data,
+      has_more: Boolean(legacy?.has_more || opus?.has_more),
+      next_offset: opus?.next_offset || legacy?.next_offset || null,
+      next_offsets: {
+        opus: opus?.next_offset || null,
+        legacy: legacy?.next_offset || null,
+      },
+    },
+  };
+}
+
 function mergePublicSection(body, name, incoming) {
   const previous = body.sections?.[name];
-  if (incoming?.ok) {
-    body.sections[name] = incoming;
-    if (name === 'public_extras') body.extras = incoming.data;
+  const normalized = normalizePublicSection(name, incoming);
+  if (normalized?.ok) {
+    body.sections[name] = normalized;
+    if (name === 'public_extras') body.extras = normalized.data;
     return;
   }
   if (previous?.ok) {
     body.sections[name] = {
       ...previous,
-      public_fallback_error: incoming?.error || null,
+      public_fallback_error: normalized?.error || null,
     };
     return;
   }
   body.sections[name] = {
     ...(previous || {}),
     ok: false,
-    error: previous?.error || incoming?.error || {
+    error: previous?.error || normalized?.error || {
       type: 'internal',
       message: `${name} failed`,
     },
-    public_fallback_error: incoming?.error || null,
+    public_fallback_error: normalized?.error || null,
   };
 }
 
@@ -326,6 +346,7 @@ export default async function handler(req, res) {
         ...(Array.isArray(body.examples) ? body.examples : []),
         '/api?mid=3546779356235807&section=everything',
         '/api?mid=3546779356235807&section=videos&complete=1&max_pages=10',
+        '/api?mid=3546779356235807&section=dynamics&offset=<next_offset>',
       ];
     }
     if (body && typeof body === 'object') body.elapsed_ms = Date.now() - started;
@@ -463,7 +484,7 @@ export default async function handler(req, res) {
         maxPages,
         pageSize,
         dynamicOffset: text(query.offset),
-        opusOffset: text(query.opus_offset),
+        opusOffset: text(query.opus_offset || query.offset),
         expandFavorites:
           bool(query.expand_favorites || query.favorite_items) || everything,
         favoriteFolderLimit: int(
