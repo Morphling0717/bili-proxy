@@ -1,12 +1,16 @@
 import coreHandler from '../lib/core.mjs';
 import {
+  AppVideoError,
+  fetchVideosWithApp,
+} from '../lib/app-videos.mjs';
+import {
   BrowserVideoError,
   fetchVideosWithBrowser,
 } from '../lib/browser-videos.mjs';
 
 export const config = { maxDuration: 120 };
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 const bool = (value) =>
   ['1', 'true', 'yes', 'on'].includes(
@@ -75,8 +79,9 @@ function riskFailure(section) {
   const message = `${section.error?.message || ''} ${upstream.message || ''}`;
   return (
     upstream.code === -352 ||
+    upstream.code === -412 ||
     [403, 412, 429].includes(upstream.http_status) ||
-    /风控|risk|forbidden|precondition|too many/iu.test(message)
+    /风控|risk|banned|forbidden|precondition|too many/iu.test(message)
   );
 }
 
@@ -106,13 +111,35 @@ function recomputeStatus(body) {
   return successful > 0 ? 200 : 502;
 }
 
-function safeBrowserFailure(error) {
+function safeVideoFailure(error, type) {
   return {
-    type: 'browser_fallback',
+    type,
     message: error?.message || String(error),
     diagnostics:
-      error instanceof BrowserVideoError ? error.diagnostics || {} : {},
+      error instanceof AppVideoError || error instanceof BrowserVideoError
+        ? error.diagnostics || {}
+        : {},
   };
+}
+
+function installVideoResult(captured, result, source) {
+  captured.body.sections.videos = {
+    ok: true,
+    data: result.data,
+    source,
+  };
+  captured.body.videos = result.data.items.map(legacyVideo);
+  captured.body.video_count = captured.body.videos.length;
+  captured.body.video_fallback = {
+    used: true,
+    source,
+    diagnostics: result.diagnostics,
+  };
+  captured.body.request = {
+    ...(captured.body.request || {}),
+    video_fallback: source,
+  };
+  captured.statusCode = recomputeStatus(captured.body);
 }
 
 function replay(captured, req, res) {
@@ -131,35 +158,101 @@ function replay(captured, req, res) {
   return res.status(status).send(captured.body);
 }
 
+function isEverything(query) {
+  const section = text(query.section || query.include || 'all')
+    .toLowerCase()
+    .trim();
+  return ['everything', 'full', 'all_public'].includes(section);
+}
+
 export default async function handler(req, res) {
   const started = Date.now();
+  const originalQuery = req.query || {};
+  const everything = isEverything(originalQuery);
+  if (everything) {
+    req.query = {
+      ...originalQuery,
+      section:
+        'profile,videos,dynamics,articles,audio,collections,favorites,following,followers',
+      complete: originalQuery.complete ?? '1',
+      max_pages: originalQuery.max_pages ?? '5',
+      request_budget: originalQuery.request_budget ?? '40',
+    };
+  }
+
+  const query = req.query || {};
   const captured = new CaptureResponse();
   await coreHandler(req, captured);
   captured.setHeader('X-Bili-Proxy-Version', VERSION);
   if (captured.body && typeof captured.body === 'object') {
     captured.body.version = VERSION;
+    if (everything) captured.body.mode = 'everything';
   }
 
-  const query = req.query || {};
-  const videoSection = captured.body?.sections?.videos;
-  const browserEnabled = !['0', 'false', 'off'].includes(
-    text(query.browser, process.env.BROWSER_FALLBACK ?? '1').toLowerCase(),
+  const body = captured.body;
+  const videoSection = body?.sections?.videos;
+  const mid = String(body?.uid || query.mid || query.uid || '');
+  const page = int(query.page, 1, 1, 10_000);
+  const pageSize = int(query.page_size || query.ps, 30, 1, 50);
+  const complete = bool(query.complete || query.deep);
+  const maxPages = int(query.max_pages, complete ? 5 : 1, 1, 10);
+
+  const appEnabled = !['0', 'false', 'off'].includes(
+    text(query.app_fallback, process.env.APP_FALLBACK ?? '1').toLowerCase(),
   );
-  const forceBrowser = bool(query.browser_force);
+  const forceApp = bool(query.app_force);
+  let appFailed = false;
 
   if (
     req.method !== 'OPTIONS' &&
-    captured.body &&
-    browserEnabled &&
+    body &&
+    appEnabled &&
     videoSection &&
-    (forceBrowser || riskFailure(videoSection))
+    (forceApp || !videoSection.ok || riskFailure(videoSection))
   ) {
     try {
-      const page = int(query.page, 1, 1, 10_000);
-      const pageSize = int(query.page_size || query.ps, 30, 1, 50);
-      const complete = bool(query.complete || query.deep);
-      const maxPages = int(query.max_pages, complete ? 5 : 1, 1, 10);
-      const mid = String(captured.body.uid || query.mid || query.uid || '');
+      const appResult = await fetchVideosWithApp({
+        mid,
+        page,
+        pageSize,
+        complete,
+        maxPages,
+        keyword: text(query.keyword).slice(0, 100),
+        timeoutMs: int(query.app_timeout_ms, 12_000, 4_000, 30_000),
+      });
+      installVideoResult(captured, appResult, 'app_archive_cursor');
+    } catch (error) {
+      appFailed = true;
+      body.video_fallback = {
+        used: false,
+        source: 'app_archive_cursor',
+        error: safeVideoFailure(error, 'app_fallback'),
+      };
+      body.sections.videos.error = {
+        ...(body.sections.videos.error || {}),
+        app_fallback: safeVideoFailure(error, 'app_fallback'),
+      };
+      body.request = {
+        ...(body.request || {}),
+        video_fallback: 'app_failed',
+      };
+    }
+  }
+
+  const browserEnabled = ['1', 'true', 'yes', 'on'].includes(
+    text(query.browser, process.env.BROWSER_FALLBACK ?? '0').toLowerCase(),
+  );
+  const forceBrowser = bool(query.browser_force);
+  const currentVideoSection = body?.sections?.videos;
+
+  if (
+    req.method !== 'OPTIONS' &&
+    body &&
+    browserEnabled &&
+    currentVideoSection &&
+    (forceBrowser || (appFailed && riskFailure(currentVideoSection)))
+  ) {
+    try {
       const browserResult = await fetchVideosWithBrowser({
         mid,
         page,
@@ -172,42 +265,26 @@ export default async function handler(req, res) {
         cookie: process.env.BI_COOKIE || '',
         timeoutMs: int(query.browser_timeout_ms, 42_000, 15_000, 55_000),
       });
-
-      captured.body.sections.videos = {
-        ok: true,
-        data: browserResult.data,
-        source: 'browser',
-      };
-      captured.body.videos = browserResult.data.items.map(legacyVideo);
-      captured.body.video_count = captured.body.videos.length;
-      captured.body.browser_fallback = {
+      installVideoResult(captured, browserResult, 'browser');
+      body.browser_fallback = {
         used: true,
         diagnostics: browserResult.diagnostics,
       };
-      captured.body.request = {
-        ...(captured.body.request || {}),
-        browser_fallback: 'used',
-      };
-      captured.statusCode = recomputeStatus(captured.body);
     } catch (error) {
-      captured.body.browser_fallback = {
+      body.browser_fallback = {
         used: false,
-        error: safeBrowserFailure(error),
+        error: safeVideoFailure(error, 'browser_fallback'),
       };
-      captured.body.request = {
-        ...(captured.body.request || {}),
-        browser_fallback: 'failed',
+      body.sections.videos.error = {
+        ...(body.sections.videos.error || {}),
+        browser_fallback: safeVideoFailure(error, 'browser_fallback'),
       };
-      captured.body.sections.videos.error = {
-        ...(captured.body.sections.videos.error || {}),
-        browser_fallback: safeBrowserFailure(error),
-      };
-      captured.statusCode = recomputeStatus(captured.body);
     }
   }
 
-  if (captured.body && typeof captured.body === 'object') {
-    captured.body.elapsed_ms = Date.now() - started;
+  if (body && typeof body === 'object') {
+    captured.statusCode = recomputeStatus(body);
+    body.elapsed_ms = Date.now() - started;
   }
   return replay(captured, req, res);
 }
