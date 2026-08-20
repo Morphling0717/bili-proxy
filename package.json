@@ -1,12 +1,12 @@
 {
   "name": "bili-proxy",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": "20.x" },
+  "engines": { "node": "24.x" },
   "scripts": {
-    "check": "node --check api/index.mjs && node --check lib/core.mjs && node --check lib/browser-videos.mjs",
-    "test": "node --test test/browser-videos.test.mjs"
+    "check": "node --check api/index.mjs && node --check lib/core.mjs && node --check lib/app-videos.mjs && node --check lib/browser-videos.mjs && node --check lib/public-sections.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "@sparticuz/chromium": "143.0.4",
