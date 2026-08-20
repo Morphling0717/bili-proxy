@@ -118,7 +118,13 @@ function legacyVideo(item) {
 }
 
 function recomputeStatus(body, fallbackStatus = 200) {
-  if (!body?.sections || typeof body.sections !== 'object') return fallbackStatus;
+  if (
+    !body?.sections ||
+    Array.isArray(body.sections) ||
+    typeof body.sections !== 'object'
+  ) {
+    return fallbackStatus;
+  }
   const sections = Object.values(body.sections);
   if (sections.length === 0) return fallbackStatus;
   const successful = sections.filter((section) => section?.ok).length;
@@ -268,7 +274,11 @@ export default async function handler(req, res) {
   }
 
   const body = captured.body;
-  if (!body?.sections || typeof body.sections !== 'object') {
+  if (
+    !body?.sections ||
+    Array.isArray(body.sections) ||
+    typeof body.sections !== 'object'
+  ) {
     if (body && bool(originalQuery.help)) {
       body.version = VERSION;
       body.modes = ['all', 'everything'];
